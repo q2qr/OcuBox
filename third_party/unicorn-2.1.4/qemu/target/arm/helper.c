@@ -5618,6 +5618,21 @@ int sve_exception_el(CPUARMState *env, int el)
 {
     uint64_t hcr_el2 = arm_hcr_el2_eff(env);
 
+    /*
+     * hollywood_emu: this function only ever checked whether SVE access is
+     * currently *trapped* by CPACR/CPTR -- it never checked whether SVE is
+     * actually *implemented* (ID_AA64PFR0_EL1.SVE). A guest that never
+     * touches those trap-control bits (because it correctly detected "no
+     * SVE" from the ID register and has no reason to enable/disable a trap
+     * for a feature it doesn't believe exists) leaves them at their permissive
+     * reset value, so real SVE opcodes execute instead of UNDEF-trapping like
+     * they must on real hardware without the extension. Route straight to the
+     * same "disabled" trap path used below when CPACR itself disables SVE.
+     */
+    if (!isar_feature_aa64_sve(&env_archcpu(env)->isar)) {
+        return (el <= 1 && (hcr_el2 & HCR_TGE)) ? 2 : 1;
+    }
+
     if (el <= 1 && (hcr_el2 & (HCR_E2H | HCR_TGE)) != (HCR_E2H | HCR_TGE)) {
         bool disabled = false;
 
@@ -11766,6 +11781,19 @@ static uint32_t rebuild_hflags_a64(CPUARMState *env, int el, int fp_el,
         }
         FIELD_DP32(flags, TBFLAG_A64, SVEEXC_EL, sve_el, flags);
         FIELD_DP32(flags, TBFLAG_A64, ZCR_LEN, zcr_len, flags);
+    } else {
+        /*
+         * hollywood_emu: when SVE isn't implemented at all, this whole trap-
+         * flag computation was skipped, leaving TBFLAG_A64.SVEEXC_EL at its
+         * default of 0 ("no exception" -- i.e. SVE instructions decode and
+         * execute normally). On real hardware an unimplemented SVE opcode is
+         * UNDEFINED regardless of any trap-control register, so force the
+         * same "trap at EL1" outcome the CPACR-disabled path uses; without
+         * this, a guest that reaches SVE code (correctly believing, via the
+         * ID registers, that it doesn't exist -- e.g. via a stale/incorrect
+         * ifunc selection) executes it instead of taking an UNDEF trap.
+         */
+        FIELD_DP32(flags, TBFLAG_A64, SVEEXC_EL, 1, flags);
     }
 
     sctlr = regime_sctlr(env, stage1);

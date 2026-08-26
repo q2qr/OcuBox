@@ -247,7 +247,12 @@ static void aarch64_max_initfn(struct uc_struct *uc, CPUState *obj)
     cpu->isar.id_aa64isar1 = t;
 
     t = cpu->isar.id_aa64pfr0;
-    FIELD_DP64(t, ID_AA64PFR0, SVE, 1, t);
+    /* hollywood_emu: leave SVE off. Real Kona (Kryo 585 / Cortex-A77+A55) has
+     * no SVE; advertising it here makes bionic's ifunc resolvers route to
+     * SVE-optimized libc routines (memcpy/memmove/strcmp/...) that this old
+     * QEMU-derived TCG core doesn't fully implement, crashing the very first
+     * userspace process (e.g. an SVE `fnmla` reached via an ifunc `blr`
+     * SIGILLs /init immediately after exec). */
     FIELD_DP64(t, ID_AA64PFR0, FP, 1, t);
     FIELD_DP64(t, ID_AA64PFR0, ADVSIMD, 1, t);
     cpu->isar.id_aa64pfr0 = t;

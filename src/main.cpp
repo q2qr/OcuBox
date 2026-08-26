@@ -60,6 +60,8 @@ struct Args {
     bool no_spin = false;   // disable spin-wait detection (for slow but progressing loops)
     bool stop_on_undef = false;
     bool trace_irq = false; // symbol-trace timer/irq functions (needs build/ksyms.txt)
+    bool trace_user = false;
+    uint64_t trace_user_insns = 20000;
     bool dump_dt = false;
     bool list_dt = false;   // print every DT node path + compatible and exit
     std::string profile = "stock";          // "stock" or "minimal"
@@ -88,6 +90,9 @@ void usage() {
         "  -v, --verbose          Verbose subsystem logging\n\n"
         "Execution options (boot):\n"
         "  --trace                Trace the first N executed instructions (disasm)\n"
+        "  --trace-user           Dump the kernel->EL0 handoff (regs + argv/envp/auxv),\n"
+        "                         then trace EL0 instructions/syscalls\n"
+        "  --trace-user-insns N   Cap on traced EL0 instructions (default 20000)\n"
         "  --max-instructions N   Cap executed instructions (default 200000000)\n"
         "  --timeout N            Wall-clock cap in seconds (default 20, 0=off)\n"
         "  --stop-on-mmio         Halt on the first unclaimed access (default)\n"
@@ -219,6 +224,14 @@ int cmd_boot(const Args& a) {
             "/soc/qcom,mdss_dsi_phy1@ae96400",   // qcom,dsi-phy-v4.1
             "/soc/qcom,mdss_dsi_pll@ae94900",    // mdss_pll (Bad page state @642M)
             "/soc/qcom,mdss_dsi_pll@ae96900",    // mdss_pll
+
+            // Camera subsystem (CPAS/CDM/SMMU/ISP) -- non-essential for a headless
+            // console boot, depends on unemulated camera regulators/clocks (probe
+            // already fails: "Regulator camss-vdd get failed -517", "CPAS probe
+            // failed"), and cam_hw_cdm_probe -> cam_smmu_get_handle then calls
+            // strcmp() on a name left NULL by the earlier failure, NULL-derefing
+            // in initcall context (PID 1) -- fatal, "Attempted to kill init!".
+            "qcom,cam170-cpas-cdm0",             // cam_hw_cdm (the fatal NULL deref)
         };
     }
     for (const auto& d : a.disable_nodes) cfg.dtb_disable.push_back(d);
@@ -237,6 +250,8 @@ int cmd_boot(const Args& a) {
     if (a.cpu_tlb) { uopts.our_mmu = false; uopts.vector_exc = false; }  // native MMU + exceptions
     uopts.stop_on_undef = a.stop_on_undef;
     if (a.trace_irq) uopts.fn_trace_ksyms = "build/ksyms.txt";
+    uopts.trace_user = a.trace_user;
+    uopts.trace_user_insns = a.trace_user_insns;
     if (a.no_spin) uopts.hot_threshold = 0;   // disable spin detection (rely on timeout)
     emu.backend = std::make_unique<cpu::UnicornCpu>(uopts);
 
@@ -280,6 +295,8 @@ int main(int argc, char** argv) {
         else if (s == "--no-spin") a.no_spin = true;
         else if (s == "--stop-on-undef") a.stop_on_undef = true;
         else if (s == "--trace-irq") a.trace_irq = true;
+        else if (s == "--trace-user") a.trace_user = true;
+        else if (s == "--trace-user-insns") a.trace_user_insns = std::strtoull(arg_val(argc, argv, i), nullptr, 10);
         else if (s == "--dump-dt") a.dump_dt = true;
         else if (s == "--list-dt") a.list_dt = true;
         else if (s == "--profile") a.profile = arg_val(argc, argv, i);

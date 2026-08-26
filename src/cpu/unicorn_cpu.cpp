@@ -7,6 +7,7 @@
 #include <chrono>
 #include <thread>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <unicorn/unicorn.h>
 #include <capstone/capstone.h>
@@ -61,11 +62,22 @@ bool UnicornCpu::attach(mem::GuestMemory& ram, dev::DeviceBus& bus, std::string&
     // stall in stage-1 translation once the MMU is enabled. "max" supports the
     // full feature set QEMU-TCG implements.
     int model = UC_CPU_ARM64_MAX;
+    if (const char* m = std::getenv("HWEMU_CPU_MODEL")) {
+        if (std::string(m) == "a72") model = UC_CPU_ARM64_A72;
+        else if (std::string(m) == "a57") model = UC_CPU_ARM64_A57;
+    }
     uc_err ce = uc_ctl_set_cpu_model(uc_, model);
     if (ce != UC_ERR_OK)
         HW_WARN("cpu.uc", "uc_ctl_set_cpu_model(max) failed ({}) -- using default", (int)ce);
     else
         HW_INFO("cpu.uc", "CPU model = ARM64 'max'");
+    {
+        uc_arm64_cp_reg pfr0 = {};
+        pfr0.op0 = 3; pfr0.op1 = 0; pfr0.crn = 0; pfr0.crm = 4; pfr0.op2 = 0;  // ID_AA64PFR0_EL1
+        uc_reg_read(uc_, UC_ARM64_REG_CP_REG, &pfr0);
+        HW_WARN("cpu.uc", "DEBUG ID_AA64PFR0_EL1 = {:#x} (SVE field bits[35:32] = {:#x})",
+                pfr0.val, (pfr0.val >> 32) & 0xf);
+    }
 
     if (opts_.host_backed_ram) {
         // Single source of truth: map the emulator's RAM buffer directly (no copy).
@@ -121,7 +133,7 @@ bool UnicornCpu::attach(mem::GuestMemory& ram, dev::DeviceBus& bus, std::string&
         // (which forces TCG to instrument every instruction and is ~10-50x slower)
         // is only added when we actually need per-instruction visibility.
         uc_hook_add(uc_, &h, UC_HOOK_BLOCK, (void*)block_cb, this, 1, 0);
-        const bool need_insn_hook = opts_.trace || !opts_.fn_trace_ksyms.empty();
+        const bool need_insn_hook = opts_.trace || !opts_.fn_trace_ksyms.empty() || opts_.trace_user;
         if (need_insn_hook)
             uc_hook_add(uc_, &h, UC_HOOK_CODE, (void*)code_cb, this, 1, 0);
         uc_hook_add(uc_, &h, UC_HOOK_MEM_UNMAPPED, (void*)unmapped_cb, this, 1, 0);
@@ -295,6 +307,64 @@ bool UnicornCpu::read_mem(uint64_t addr, void* buf, size_t len) {
     return false;
 }
 
+// --trace-user: dump the kernel->EL0 handoff the first time PC lands in the
+// user half -- registers plus the initial stack layout the kernel's ELF
+// loader built (argc, argv[], envp[], auxv[]), per the arm64 user-mode ABI.
+void UnicornCpu::dump_el0_entry() {
+    uint64_t pc = 0, sp = 0, pstate = 0;
+    uc_reg_read(uc_, UC_ARM64_REG_PC, &pc);
+    uc_reg_read(uc_, UC_ARM64_REG_SP, &sp);
+    uc_reg_read(uc_, UC_ARM64_REG_PSTATE, &pstate);
+
+    uc_arm64_cp_reg treg = {};
+    treg.op0 = 3; treg.op1 = 3; treg.crn = 13; treg.crm = 0; treg.op2 = 2;  // TPIDR_EL0
+    uc_reg_read(uc_, UC_ARM64_REG_CP_REG, &treg);
+
+    HW_WARN("user", "=== EL0 ENTRY ===  PC={:#x} SP={:#x} PSTATE={:#x} TPIDR_EL0={:#x}",
+            pc, sp, pstate, treg.val);
+    for (int i = 0; i < 31; i += 2) {
+        uint64_t a = 0, b = 0;
+        uc_reg_read(uc_, xreg(i), &a);
+        if (i + 1 < 31) { uc_reg_read(uc_, xreg(i + 1), &b);
+            HW_WARN("user", "  X{:<2} = {:#018x}   X{:<2} = {:#018x}", i, a, i + 1, b);
+        } else {
+            HW_WARN("user", "  X{:<2} = {:#018x}", i, a);
+        }
+    }
+
+    auto read_cstr = [&](uint64_t addr) -> std::string {
+        if (!addr) return "(null)";
+        char buf[128] = {};
+        if (!read_mem(addr, buf, sizeof(buf) - 1)) return "(unreadable)";
+        return std::string(buf);
+    };
+    auto read_u64 = [&](uint64_t addr, uint64_t& out) { return read_mem(addr, &out, 8); };
+
+    uint64_t argc = 0;
+    if (!read_u64(sp, argc)) { HW_WARN("user", "  (initial stack at SP is unreadable)"); return; }
+    HW_WARN("user", "  argc = {}", argc);
+    uint64_t off = 8;
+    for (uint64_t i = 0; i < argc && i < 32; ++i) {
+        uint64_t p = 0; read_u64(sp + off, p); off += 8;
+        HW_WARN("user", "  argv[{}] = {:#x}  \"{}\"", i, p, read_cstr(p));
+    }
+    off += 8;  // argv NULL terminator
+    for (int i = 0; i < 32; ++i) {
+        uint64_t p = 0;
+        if (!read_u64(sp + off, p)) break;
+        off += 8;
+        if (!p) break;
+        HW_WARN("user", "  envp[{}] = {:#x}  \"{}\"", i, p, read_cstr(p));
+    }
+    for (int i = 0; i < 40; ++i) {
+        uint64_t type = 0, val = 0;
+        if (!read_u64(sp + off, type)) break; off += 8;
+        if (!read_u64(sp + off, val)) break; off += 8;
+        if (type == 0) break;
+        HW_WARN("user", "  auxv[{}]  type={:<3}  val={:#x}", i, type, val);
+    }
+}
+
 // ---- Unicorn C callbacks ----
 
 uint64_t UnicornCpu::mmio_read_cb(uc_engine* uc, uint64_t offset, unsigned size, void* user) {
@@ -401,6 +471,31 @@ void UnicornCpu::code_cb(uc_engine* uc, uint64_t address, uint32_t /*size*/, voi
             auto nm = self->fn_retstk_.back().second; self->fn_retstk_.pop_back();
             HW_WARN("trace", "{}< {} = {:#x}", std::string(self->fn_retstk_.size()*2, ' '), nm, x0);
             self->fn_trace_lines_++;
+        }
+    }
+
+    // --trace-user: a low-half (bit63=0) PC is NOT sufficient to mean EL0 --
+    // the kernel itself briefly runs position-independent code at low/identity
+    // addresses (e.g. cpu_replace_ttbr1(), which does `msr ttbr1_el1`, a
+    // privileged write). Check PSTATE's mode field (M[3:0]==0 is EL0t; EL1
+    // never uses that encoding) so we only trigger on genuine EL0 entry.
+    if (self->opts_.trace_user && self->mmu_on_ && (address >> 63) == 0) {
+        uint64_t pstate_now = 0; uc_reg_read(uc, UC_ARM64_REG_PSTATE, &pstate_now);
+        if ((pstate_now & 0xf) == 0) {
+            if (!self->user_entered_) {
+                self->user_entered_ = true;
+                self->dump_el0_entry();
+            }
+            if (self->user_traced_ < self->opts_.trace_user_insns) {
+                self->user_traced_++;
+                std::string dis = self->disasm_str(address);
+                HW_WARN("user", "EL0 PC={:#x}  {}", address, dis);
+                if (dis.rfind("svc", 0) == 0) {
+                    uint64_t x8 = 0; uc_reg_read(uc, UC_ARM64_REG_X8, &x8);
+                    self->user_svc_count_++;
+                    HW_WARN("user", "  syscall #{} (nr={})", self->user_svc_count_, x8);
+                }
+            }
         }
     }
 }
